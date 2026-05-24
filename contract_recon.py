@@ -269,6 +269,169 @@ def lookup_signature(selector: str) -> list:
 
 
 # ============================================================================
+# 模块 4.5：选择器碰撞检测（重要！）
+# ============================================================================
+# 启发式：识别"爆破生成的垃圾签名"
+# 这类签名通常具有以下特征：
+#   - 函数名是英文单词的随机组合（动词+形容词+名词）
+#   - 函数名没有任何业务意义
+#   - 4byte 数据库里大量这种名字，是 hash 爆破出来填字典的
+GARBAGE_NAME_PATTERNS = [
+    r"^func_\d+",                      # func_2093253501 这种
+    r"^[a-z]+_[a-z]+_[a-z]+\(",        # foo_bar_baz(
+    r"^[A-Z][a-z]+[A-Z][a-z]+[A-Z]",   # WorkMyDireful 这种 CamelCase 拼接
+    r"\([a-z]+1\)",                    # 单字节参数 like (bytes1)
+]
+
+# 业务关键字（看到就知道是真函数）
+BUSINESS_KEYWORDS = [
+    "transfer", "approve", "mint", "burn", "withdraw", "deposit",
+    "swap", "claim", "stake", "unstake", "harvest", "exit",
+    "balance", "supply", "owner", "admin", "name", "symbol",
+    "factory", "pair", "router", "oracle", "vault", "pool",
+    "permit", "delegate", "vote", "propose",
+]
+
+def classify_signature(sig: str) -> str:
+    """
+    把一个签名分类为：
+      'real'     —— 看着像真函数（带业务关键字）
+      'garbage'  —— 看着是爆破出来的字典污染
+      'neutral'  —— 不确定
+
+    分类顺序很重要：先判垃圾、再判真实。
+    因为像 'workMyDirefulOwner' 这种爆破生成的名字会"碰巧"包含 owner 关键字。
+    """
+    if not sig:
+        return "neutral"
+
+    name_part = sig.split("(")[0]
+
+    # 1. 先判垃圾——优先级最高
+    # 1a. 明显的占位名字
+    if re.match(r"^func_\d+", sig) or re.match(r"^Unresolved_", sig):
+        return "garbage"
+
+    # 1b. 名字过短或异常长
+    if len(name_part) < 3 or len(name_part) > 35:
+        return "garbage"
+
+    # 1c. CamelCase 单词拼接 ≥ 3 个（典型爆破特征）
+    # 例：workMyDirefulOwner = work + My + Direful + Owner = 4 段
+    cc_segments = re.findall(r"[A-Z][a-z]+", name_part)
+    if len(cc_segments) >= 3:
+        # 但要排除合法的多词函数（transferOwnership / transferFromAndCall 等）
+        legit_compound = [
+            "transferOwnership", "transferFromAndCall", "safeTransferFrom",
+            "renounceOwnership", "increaseAllowance", "decreaseAllowance",
+            "permitForAll", "supportsInterface", "tokenOfOwnerByIndex",
+            "tokenByIndex", "isApprovedForAll", "setApprovalForAll",
+        ]
+        if name_part not in legit_compound:
+            # 还要检查是否含有"罕见单词"——如 Direful, Babbage, Treant 等
+            rare_word_indicators = [
+                "direful", "babbage", "treant", "hewer", "shyster",
+                "frenetic", "lurid", "morose", "feign", "trove",
+            ]
+            if any(rw in name_part.lower() for rw in rare_word_indicators):
+                return "garbage"
+            # 即使没罕见词，4+ 段拼接的命名也极少见
+            if len(cc_segments) >= 4:
+                return "garbage"
+
+    # 1d. 单字节参数（典型爆破工具产物，如 (bytes1)）
+    if re.search(r"\((bytes1|bytes2)\)", sig):
+        return "garbage"
+
+    # 1e. 参数列表里大量短别名（如 bytes4[9],bytes5[6] 这种异常组合）
+    params = sig[sig.find("(")+1:sig.rfind(")")] if "(" in sig else ""
+    if params.count("[") >= 3:  # 三个以上数组
+        return "garbage"
+
+    # 1f. 下划线分隔的多 token 名（如 join_tg_invmru_haha_fd06787）
+    # 这是 hashbreaker 工具的典型产物
+    if name_part.count("_") >= 3:
+        return "garbage"
+
+    # 1g. 函数名里有连续数字 ≥ 5 位（哈希残留）
+    if re.search(r"\d{5,}", name_part):
+        return "garbage"
+
+    # 1h. 函数名里有明显的 hex 后缀（如 _fd06787 / xa3b4f5）
+    if re.search(r"[_x][0-9a-f]{6,}", name_part.lower()):
+        return "garbage"
+
+    # 2. 再判真实——业务关键字命中
+    sig_lower = sig.lower()
+    for kw in BUSINESS_KEYWORDS:
+        if kw in sig_lower:
+            return "real"
+
+    return "neutral"
+
+
+def detect_selector_collisions(functions: list, proxy_info: dict) -> list:
+    """
+    检测三类选择器碰撞风险：
+    1. 字典碰撞：同一选择器在 4byte 里对应多个签名（提示需人工判断）
+    2. 代理碰撞：代理合约和实现合约有相同选择器（Audius-style 漏洞前置条件）
+    3. 垃圾签名：明显是爆破生成的"占位名字"
+    """
+    warnings = []
+
+    for f in functions:
+        sigs = f.get("signatures", [])
+
+        # 检查 1: 字典碰撞
+        if len(sigs) >= 2:
+            real_count = sum(1 for s in sigs if classify_signature(s) == "real")
+            garbage_count = sum(1 for s in sigs if classify_signature(s) == "garbage")
+
+            if real_count >= 2:
+                # 多个真实签名 = 高风险碰撞（可能被攻击者主动构造）
+                warnings.append({
+                    "selector": f["selector"],
+                    "level": "HIGH",
+                    "type": "DICT_COLLISION",
+                    "message": f"该选择器对应 {real_count} 个看似真实的函数签名，"
+                               f"需要结合字节码逻辑确认实际调用的是哪个：{[s for s in sigs if classify_signature(s) == 'real']}",
+                })
+            elif garbage_count >= 1 and real_count >= 1:
+                # 有真有假 = 字典污染（中等风险）
+                warnings.append({
+                    "selector": f["selector"],
+                    "level": "MEDIUM",
+                    "type": "DICT_NOISE",
+                    "message": f"4byte 字典里夹杂爆破生成的垃圾签名（如 "
+                               f"{[s for s in sigs if classify_signature(s) == 'garbage'][:1]}），"
+                               f"实际函数应是 {[s for s in sigs if classify_signature(s) == 'real'][:1]}",
+                })
+
+    return warnings
+
+
+def detect_proxy_collisions(proxy_selectors: set, impl_selectors: set) -> list:
+    """
+    检测代理合约 ↔ 实现合约之间的选择器冲突。
+    这是 Audius hack ($6M) 的攻击根因——
+    攻击者构造一个函数名让其选择器与代理合约 admin 函数重合，
+    从而绕过权限检查直接命中实现合约。
+    """
+    overlap = proxy_selectors & impl_selectors
+    if not overlap:
+        return []
+
+    return [{
+        "selector": sel,
+        "level": "CRITICAL",
+        "type": "PROXY_COLLISION",
+        "message": f"⚠️ 代理合约和实现合约都有此选择器！这是 Audius-style 漏洞的前置条件。"
+                   f"调用此 selector 时会被代理截胡，永远到不了实现合约——"
+                   f"或者反过来，实现合约里的同名函数会被代理的同选择器函数遮蔽。",
+    } for sel in overlap]
+
+
+# ============================================================================
 # 模块 4：危险等级评估
 # ============================================================================
 def assess_danger(signatures: list) -> str:
@@ -410,13 +573,31 @@ def analyze_contract(addr: str, w3: Web3, scanner_url: Optional[str] = None,
     # 4. 提取选择器
     all_selectors = set()
     high_conf_selectors = set()
-    for c in bytecodes.values():
+    proxy_only_selectors = set()  # 仅代理有的
+    impl_only_selectors = set()   # 仅实现有的
+    proxy_dispatcher = set()
+    impl_dispatcher = set()
+
+    for contract_addr, c in bytecodes.items():
         push4_set, dispatcher_set = extract_selectors(c)
         all_selectors |= push4_set
         high_conf_selectors |= dispatcher_set
 
+        # 分别记录代理和实现的选择器，用于碰撞检测
+        if proxy_info.get("impl") and contract_addr == proxy_info["impl"]:
+            impl_dispatcher = dispatcher_set
+        else:
+            proxy_dispatcher = dispatcher_set
+
     console.print(f"🔍 扫描出选择器: 共 [bold]{len(all_selectors)}[/bold] 个候选, "
                   f"其中 [bold green]{len(high_conf_selectors)}[/bold green] 个高置信度（dispatcher 模式）\n")
+
+    # 4.5 检测代理 ↔ 实现合约的选择器冲突（Audius-style 漏洞）
+    proxy_collisions = []
+    if proxy_dispatcher and impl_dispatcher:
+        proxy_collisions = detect_proxy_collisions(proxy_dispatcher, impl_dispatcher)
+        if proxy_collisions:
+            console.print(f"\n[bold red]⚠️  发现 {len(proxy_collisions)} 个代理↔实现选择器碰撞！[/bold red]")
 
     # 5. 对每个选择器：反查 + 评估 + 探测
     functions = []
@@ -462,6 +643,11 @@ def analyze_contract(addr: str, w3: Web3, scanner_url: Optional[str] = None,
         console.print("\n📜 拉取历史交易样本...")
         calldata_samples = fetch_recent_calldata_samples(addr, scanner_url, api_key)
 
+    # 7.5 检测字典碰撞
+    dict_warnings = detect_selector_collisions(
+        [asdict(f) for f in functions], proxy_info
+    )
+
     # 8. 构建报告
     report = {
         "address": addr,
@@ -472,6 +658,10 @@ def analyze_contract(addr: str, w3: Web3, scanner_url: Optional[str] = None,
         "functions": [asdict(f) for f in functions],
         "interesting_strings": interesting_strings,
         "calldata_samples_count": {sel: len(s) for sel, s in calldata_samples.items()},
+        "collision_warnings": {
+            "proxy_collisions": proxy_collisions,
+            "dictionary_collisions": dict_warnings,
+        },
     }
 
     return report
@@ -484,6 +674,20 @@ DANGER_COLORS = {"RED": "red", "ORANGE": "yellow", "YELLOW": "yellow",
                  "GREEN": "green", "UNKNOWN": "white"}
 DANGER_ICONS = {"RED": "🔴", "ORANGE": "🟠", "YELLOW": "🟡",
                 "GREEN": "🟢", "UNKNOWN": "⚪"}
+
+def filter_signatures(sigs: list) -> tuple:
+    """
+    把签名列表分成两份：(真实签名, 垃圾签名)
+    """
+    real, garbage = [], []
+    for s in sigs:
+        cls = classify_signature(s)
+        if cls == "garbage":
+            garbage.append(s)
+        else:
+            real.append(s)
+    return real, garbage
+
 
 def print_report(report: dict):
     if "error" in report:
@@ -506,13 +710,23 @@ def print_report(report: dict):
             level = f["danger_level"]
             icon = DANGER_ICONS[level]
             color = DANGER_COLORS[level]
-            sigs = " | ".join(f["signatures"][:2]) if f["signatures"] else "[grey50]【未知】[/grey50]"
+
+            real_sigs, garbage_sigs = filter_signatures(f["signatures"])
+            if real_sigs:
+                sigs_display = " | ".join(real_sigs[:2])
+                if garbage_sigs:
+                    sigs_display += f" [grey50](+{len(garbage_sigs)} 个垃圾签名已隐藏)[/grey50]"
+            elif garbage_sigs:
+                sigs_display = f"[grey50]{garbage_sigs[0]} (疑似爆破生成)[/grey50]"
+            else:
+                sigs_display = "[grey50]【未知】[/grey50]"
+
             result = f["static_call_result"][:42] if f["static_call_result"] else "—"
 
             table.add_row(
                 f"{icon}",
                 f"[{color}]{f['selector']}[/{color}]",
-                sigs,
+                sigs_display,
                 result,
             )
         console.print(table)
@@ -563,6 +777,41 @@ def print_report(report: dict):
     if report["proxy"]["is_proxy"]:
         console.print(f"  🔗 这是代理合约，实现合约可被升级。请确认 ProxyAdmin "
                       f"({report['proxy'].get('admin') or '未设置'}) 不是单 EOA。")
+
+    # 碰撞警告区
+    collision = report.get("collision_warnings", {})
+    proxy_col = collision.get("proxy_collisions", [])
+    dict_col = collision.get("dictionary_collisions", [])
+
+    if proxy_col or dict_col:
+        console.print("\n[bold red]═══ ⚠️  选择器碰撞警告 ═══[/bold red]\n" if HAS_RICH
+                      else "\n=== 选择器碰撞警告 ===\n")
+
+        if proxy_col:
+            console.print("[bold red]🚨 CRITICAL：代理 ↔ 实现选择器冲突（Audius-style 漏洞前置条件）[/bold red]")
+            for w in proxy_col:
+                console.print(f"  • {w['selector']}")
+                console.print(f"    {w['message']}\n")
+
+        if dict_col:
+            high_warnings = [w for w in dict_col if w["level"] == "HIGH"]
+            med_warnings = [w for w in dict_col if w["level"] == "MEDIUM"]
+
+            if high_warnings:
+                console.print(f"[bold yellow]⚠️  HIGH：{len(high_warnings)} 个选择器对应多个真实签名（人工判定哪个是真）[/bold yellow]")
+                for w in high_warnings:
+                    console.print(f"  • {w['selector']}")
+                    console.print(f"    {w['message']}\n")
+
+            if med_warnings:
+                console.print(f"[yellow]ℹ️  MEDIUM：{len(med_warnings)} 个选择器存在 4byte 字典污染（已自动过滤显示）[/yellow]")
+                for w in med_warnings[:3]:  # 只显示前 3 条避免刷屏
+                    console.print(f"  • {w['selector']}: {w['message'][:120]}")
+                if len(med_warnings) > 3:
+                    console.print(f"  • ... 还有 {len(med_warnings) - 3} 条，详见 JSON 报告")
+    else:
+        console.print(f"\n[green]✅ 未检测到选择器碰撞风险[/green]" if HAS_RICH
+                      else "\n✅ 未检测到选择器碰撞风险")
 
 
 # ============================================================================
