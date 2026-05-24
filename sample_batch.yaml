@@ -1,0 +1,33 @@
+# 批量交易示例配置文件
+# 用法: python batch_tx.py run --config sample_batch.yaml --chain arb --key $PK
+
+txs:
+  # 1. 给 Uniswap router 授权 USDC
+  - to: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"   # USDC on Arbitrum
+    signature: "approve(address,uint256)"
+    args:
+      - "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"   # Uniswap V3 SwapRouter
+      - "max"
+
+  # 2. 给 Uniswap router 授权 WETH
+  - to: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH on Arbitrum
+    signature: "approve(address,uint256)"
+    args:
+      - "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+      - "max"
+
+  # 3. 调用一个无参函数（如 claim 奖励）
+  - to: "0xYourVault..."
+    signature: "claimRewards()"
+    args: []
+
+  # 4. 转 0.01 ETH 调用 payable 函数
+  - to: "0xPaymentReceiver..."
+    signature: "deposit()"
+    args: []
+    value: "0.01 ether"
+
+  # 5. 直接给 calldata（高级）
+  - to: "0xSomeContract..."
+    calldata: "0xabcd1234..."
+    value: "0"
