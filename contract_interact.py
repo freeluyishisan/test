@@ -139,9 +139,43 @@ def resolve_rpc(chain: Optional[str], rpc: Optional[str]) -> tuple:
 # 工具函数：选择器、ABI 编码解码
 # ============================================================================
 def function_selector(signature: str) -> bytes:
-    """计算函数选择器：keccak256(signature)[:4]"""
-    canonical = canonicalize_signature(signature)
+    """
+    计算函数选择器：keccak256(signature)[:4]
+    Foundry 风格 'name()(string)' 会被剥离 returns 部分，只对 'name()' 计算。
+    """
+    canonical = strip_returns(canonicalize_signature(signature))
     return keccak(text=canonical)[:4]
+
+
+def strip_returns(sig: str) -> str:
+    """
+    剥离 Foundry 风格的 returns：
+      'name()(string)'             → 'name()'
+      'balanceOf(address)(uint256)' → 'balanceOf(address)'
+      'swap(uint256) returns (uint)' → 'swap(uint256)'
+    """
+    # 形式 1: ... returns (...)
+    if "returns" in sig:
+        return sig[:sig.index("returns")].rstrip().rstrip(",")
+    # 形式 2: foo()(T) — 找第一对配平的括号，后面如果还有 ( 就剥掉
+    if "(" not in sig:
+        return sig
+    start = sig.index("(")
+    depth = 1
+    end = start + 1
+    while end < len(sig) and depth > 0:
+        if sig[end] == "(":
+            depth += 1
+        elif sig[end] == ")":
+            depth -= 1
+        if depth == 0:
+            break
+        end += 1
+    head = sig[:end+1]
+    rest = sig[end+1:].strip()
+    if rest.startswith("("):
+        return head
+    return sig
 
 
 def canonicalize_signature(sig: str) -> str:
@@ -155,9 +189,24 @@ def canonicalize_signature(sig: str) -> str:
 
 
 def parse_arg_types(sig: str) -> list:
-    """从 transfer(address,uint256) 提取 ['address', 'uint256']"""
+    """
+    从 transfer(address,uint256) 提取 ['address', 'uint256']
+    也支持 Foundry 风格 'name()(string)' —— 只取第一对括号内（输入类型）。
+    """
     sig = canonicalize_signature(sig)
-    inside = sig[sig.index("(")+1:sig.rindex(")")]
+    # 找到第一对括号（即输入参数）
+    start = sig.index("(")
+    depth = 1
+    end = start + 1
+    while end < len(sig) and depth > 0:
+        if sig[end] == "(":
+            depth += 1
+        elif sig[end] == ")":
+            depth -= 1
+        if depth == 0:
+            break
+        end += 1
+    inside = sig[start+1:end]
     if not inside:
         return []
     # 处理嵌套 tuple、数组
@@ -179,6 +228,38 @@ def parse_arg_types(sig: str) -> list:
     if cur:
         types.append(cur)
     return types
+
+
+def parse_return_types(sig: str) -> list:
+    """
+    解析 Foundry 风格的 returns 类型：
+      "name()(string)"            → ["string"]
+      "balanceOf(address)(uint256)" → ["uint256"]
+      "swap(...) returns (uint)"  → ["uint256"]
+    没有显式 returns 时返回空列表。
+    """
+    sig = canonicalize_signature(sig)
+    # 模式 1: "func() returns (T)"
+    if "returns" in sig:
+        ret_part = sig[sig.index("returns")+7:].strip()
+        return parse_arg_types(ret_part)
+    # 模式 2: "func()(T)" Foundry 风格
+    # 找第一对括号结束后还有第二对
+    start = sig.index("(")
+    depth = 1
+    end = start + 1
+    while end < len(sig) and depth > 0:
+        if sig[end] == "(":
+            depth += 1
+        elif sig[end] == ")":
+            depth -= 1
+        if depth == 0:
+            break
+        end += 1
+    rest = sig[end+1:].strip()
+    if rest.startswith("("):
+        return parse_arg_types(rest)
+    return []
 
 
 def parse_value(arg_type: str, raw: str, w3: Web3) -> Any:
@@ -255,16 +336,17 @@ def encode_calldata(signature: str, args: list, w3: Web3) -> bytes:
 
 
 def decode_return_value(signature: str, raw_bytes: bytes) -> Any:
-    """根据签名末尾的 returns(...) 解码返回值"""
+    """
+    根据签名末尾的 returns(...) 或 Foundry 风格 ()(T) 解码返回值。
+    没有显式 return 类型时返回原始 bytes。
+    """
     from eth_abi import decode
 
     if not raw_bytes:
         return None
-    # 没显式 return type 的话，按字节展示
-    if "returns" not in signature:
+    ret_types = parse_return_types(signature)
+    if not ret_types:
         return raw_bytes
-    ret_part = signature[signature.index("returns")+7:].strip()
-    ret_types = parse_arg_types(ret_part)
     try:
         return decode(ret_types, raw_bytes)
     except Exception:
@@ -554,7 +636,8 @@ def cmd_read(args, w3: Web3):
                   else f"\n返回: 0x{result.hex()}")
 
     # 自动猜返回类型
-    if "returns" in sig:
+    ret_types = parse_return_types(sig) if 'parse_return_types' in dir() else []
+    if "returns" in sig or sig.count("(") >= 2:
         decoded = decode_return_value(sig, result)
         console.print(f"   解码后: [bold]{decoded}[/bold]" if HAS_RICH else f"解码: {decoded}")
     else:

@@ -1,14 +1,19 @@
 # EVM 合约工具集
 
-一套从「侦察」到「调用」到「攻防」的完整 EVM 合约工具，复盘 DIA / AutoForwarder 攻击事件衍生而来。
+一套从「侦察」到「调用」到「批量」到「攻防」的完整 EVM 合约工具集，复盘 DIA / AutoForwarder 攻击事件衍生而来。
 
-| 工具 | 用途 |
-|---|---|
-| 🔍 [`contract_recon.py`](#contract_reconpy) | **只读侦察**：把字节码里的所有函数挖出来、反查名字、危险等级评估、碰撞检测 |
-| ⚡ [`contract_interact.py`](#contract_interactpy) | **完整交互**：调用 view 函数、发真实交易、模拟、编解码 calldata |
-| 💥 [`selector_collide.py`](#selector_collidepy) | **碰撞构造**：暴力爆破能撞上目标 selector 的函数名（红队/审计向） |
-| 📊 [`selector_stats.py`](#selector_statspy) | **频率分析**：批量分析合约选择器、跨链对比字节码 |
-| 🔧 [`heimdall_integration.py`](#heimdall_integrationpy) | **深度反编译**：包装 Heimdall CLI，反汇编/反编译/CFG |
+## 工具一览
+
+| 工具 | 用途 | 子命令数 |
+|---|---|---|
+| 🔍 [`contract_recon.py`](./contract_recon.py) | **只读侦察**：把字节码里的所有函数挖出来、反查名字、危险等级评估、碰撞检测 | 1 |
+| ⚡ [`contract_interact.py`](./contract_interact.py) | **完整交互**：read / write / simulate / encode / decode / balance / nonce | 10 |
+| 📦 [`batch_tx.py`](./batch_tx.py) | **批量交易**：批量 approve / transfer / drain / 任意 YAML 配置 | 5 |
+| 🏦 [`flashloan.py`](./flashloan.py) | **闪电贷**：Aave V3 / Balancer V2 一键集成 + Solidity 模板生成 | 4 |
+| 🛠 [`cast.py`](./cast.py) | **Foundry cast 兼容**：习惯 Foundry 的人直接用熟悉的命令风格 | 27 |
+| 💥 [`selector_collide.py`](./selector_collide.py) | **碰撞构造**：暴力爆破能撞上目标 selector 的函数名（红队向） | 3 |
+| 📊 [`selector_stats.py`](./selector_stats.py) | **频率分析**：批量分析合约选择器、跨链对比字节码 | 3 |
+| 🔧 [`heimdall_integration.py`](./heimdall_integration.py) | **深度反编译**：包装 Heimdall CLI | 4 |
 
 ---
 
@@ -18,7 +23,7 @@
 pip install -r requirements.txt
 ```
 
-可选（`heimdall_integration.py` 需要）：
+可选（Heimdall 反编译需要）：
 ```bash
 cargo install --git https://github.com/Jon-Becker/heimdall-rs heimdall
 ```
@@ -27,228 +32,322 @@ cargo install --git https://github.com/Jon-Becker/heimdall-rs heimdall
 
 ## 多链 / 本地节点 一键切换
 
-所有工具都支持 `--chain` 参数：
+所有工具都支持：
 
 ```
-eth, arb, op, base, bsc, polygon, avax, scroll, linea, blast,
+eth, arb, op, base, bsc, polygon, avax, scroll, linea, blast, mantle, celo,
 local (= http://127.0.0.1:8545), anvil, hardhat, sepolia, holesky
 ```
 
-或者用 `--rpc` 直接给完整 URL，或者环境变量 `RPC_URL`。
-
 ```bash
-# 默认 Arbitrum
-python contract_recon.py 0x...
-
-# 显式指定
-python contract_recon.py 0x... --chain bsc
-python contract_recon.py 0x... --rpc https://eth.llamarpc.com
-
-# 本地 Anvil
-python contract_interact.py read 0xToken "balanceOf(address)" 0xMe --chain local
+python contract_recon.py 0x... --chain bsc          # 用预设
+python contract_recon.py 0x... --rpc https://...    # 用自定义 URL
+python contract_interact.py read 0x... "name()" --chain local   # 本地 Anvil
+export RPC_URL=https://my-private-rpc.io            # 用环境变量
 ```
 
 ---
 
-## `contract_recon.py`
-
-**纯侦察工具**，不会发任何交易、不需要私钥。
+## 🔍 contract_recon.py — 纯侦察
 
 ```bash
+# 标准用法
 python contract_recon.py 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559
+
+# 跳过静态调用（更快）
+python contract_recon.py 0x... --no-probe
+
+# JSON 报告
+python contract_recon.py 0x... --out report.json
 ```
 
-输出：
-- 字节码大小 + 是否代理合约
-- 所有 public/external 函数选择器
-- 函数名反查（4byte + Openchain + 内置字典）
-- 危险等级标注（🔴RED / 🟠ORANGE / 🟡YELLOW / 🟢GREEN）
-- **选择器碰撞检测**（字典污染 + 代理↔实现冲突）
-- 字节码里的可见错误信息字符串
-- 安全建议
-
-详见之前的版本说明。
+输出：危险等级标注（🔴RED / 🟠ORANGE / 🟡YELLOW / 🟢GREEN）+ 选择器碰撞警告 + 字节码字符串。
 
 ---
 
-## `contract_interact.py`
-
-**主力工具**——完整的合约交互能力，从 read 到 write。
-
-### 子命令一览
+## ⚡ contract_interact.py — 主交互工具
 
 ```bash
-python contract_interact.py info <addr>             # 查看合约函数列表
-python contract_interact.py read <addr> <sig> [args] # 调用 view（不花钱）
-python contract_interact.py call <addr> <sig> [args] # 智能调用，自动判断
-python contract_interact.py write <addr> <sig> [args] --key $PK   # 发交易
-python contract_interact.py simulate <addr> <sig> [args] --key $PK # 模拟
-python contract_interact.py encode <sig> [args]     # 离线编码 calldata
-python contract_interact.py decode <calldata>       # 解码 calldata
-python contract_interact.py balance <addr>          # 查余额
-python contract_interact.py nonce <addr>            # 查 nonce
-python contract_interact.py raw <addr> <calldata>   # 原始 calldata 调用
+# 信息
+python contract_interact.py info     <addr>
+python contract_interact.py balance  <addr>
+python contract_interact.py nonce    <addr>
+
+# 读
+python contract_interact.py read <addr> "balanceOf(address)" 0xMe
+python contract_interact.py read 0xToken "name()"
+
+# 编/解码
+python contract_interact.py encode "approve(address,uint256)" 0xRouter "1 ether"
+python contract_interact.py decode 0xa9059cbb000000... --signature "transfer(address,uint256)"
+
+# 模拟
+python contract_interact.py simulate <addr> "<sig>" [args] --key $PK
+
+# 写交易（真发，会花 gas）
+python contract_interact.py write <addr> "<sig>" [args] --key $PK -y
+python contract_interact.py write 0xToken "transfer(address,uint256)" 0xRecv "1 ether" \
+    --keystore ~/keys/wallet.json
 ```
 
-### 私钥来源（按优先级）
-
-1. `--key 0x...` 命令行参数
-2. `--keystore ~/keys/wallet.json` keystore 文件（会交互式询问密码或读 `KEYSTORE_PASSWORD`）
-3. 环境变量 `PRIVATE_KEY`
-4. 环境变量 `KEYSTORE_PATH`
-
-### 实战例子
-
-```bash
-# 查代币余额（Arbitrum）
-python contract_interact.py read 0xUSDT "balanceOf(address)" 0x123... --chain arb
-
-# 模拟一笔 USDT 转账，看会不会成功
-python contract_interact.py write 0xUSDT \
-    "transfer(address,uint256)" 0xRecipient "100 ether" \
-    --key $PRIVATE_KEY --simulate
-
-# 模拟通过后真发（会先模拟一遍兜底，加 -y 跳过交互确认）
-python contract_interact.py write 0xUSDT \
-    "transfer(address,uint256)" 0xRecipient "100 ether" \
-    --key $PRIVATE_KEY -y
-
-# 调用项目自定义函数（DAI rescue tokens）
-python contract_interact.py write 0xVault \
-    "rescueTokens(address,uint256)" 0xToken 1000000 \
-    --keystore ~/keys/admin.json
-
-# 编码 calldata（离线生成，配合 Safe 签名等）
-python contract_interact.py encode \
-    "approve(address,uint256)" 0xRouter "1000 ether"
-
-# 解码不知道的 calldata
-python contract_interact.py decode 0xa9059cbb000000000000000000000000...
-
-# 本地 Anvil 测试
-python contract_interact.py write 0xMyContract "setOwner(address)" 0xNewOwner \
-    --chain local --key 0xac0974bec...
-```
-
-### 写交易时的安全检查链
-
-每次 `write` 都会：
-
-1. **估算 gas**（含 20% buffer）
-2. **检查余额**够不够
-3. **eth_call 模拟一遍**（兜底防止白扔 gas）
-4. **打印交易摘要表格**（from / to / 函数 / 参数 / value / gas / 费用 / chainId / calldata）
-5. **交互式确认**（`--yes` 跳过）
-6. **签名 + 广播 + 等待回执**
-
-如果模拟失败，默认会拒绝发送；要硬发请加 `--force`。
-
-### EIP-1559 vs Legacy
-
-- 默认 EIP-1559：`maxFeePerGas = baseFee × 2 + priority`，`priority = 1.5 gwei`
-- 加 `--gas-price 50` 自动切到 legacy 模式
-- 加 `--priority 3` 调整 EIP-1559 priority
+每次写交易会先 estimate gas → 检查余额 → eth_call 模拟 → 显示摘要表 → 交互确认 → 签名广播。
 
 ---
 
-## `selector_collide.py`
+## 📦 batch_tx.py — 批量交易（新）
 
-**进攻向**工具，用于研究函数选择器碰撞（Audius hack 那类漏洞）。
+### 批量 read（Multicall3 一笔 RPC 拿 N 个返回）
 
 ```bash
-# 计算签名的选择器
+python batch_tx.py read --chain arb --calls '[
+  ["0xToken","totalSupply()"],
+  ["0xToken","name()"],
+  ["0xToken","decimals()"]
+]'
+```
+
+### 批量 approve
+
+```bash
+# 一个 token 给多个 spender
+python batch_tx.py approve --chain arb --key $PK \
+    --token 0xUSDC \
+    --spenders 0xRouter1,0xRouter2,0xRouter3 \
+    --amount max
+
+# 多个 token 给同一个 spender（典型授权场景）
+python batch_tx.py approve --chain arb --key $PK \
+    --tokens 0xUSDC,0xUSDT,0xDAI \
+    --spender 0xRouter \
+    --amount "1000 ether"
+```
+
+### 批量空投
+
+```bash
+# 命令行格式
+python batch_tx.py transfer --chain arb --key $PK \
+    --token 0xUSDC \
+    --recipients "0xA:1000000,0xB:2000000,0xC:500000"
+
+# CSV 文件（每行 addr,amount）
+python batch_tx.py transfer --chain arb --key $PK \
+    --token 0xUSDC --recipients-file ./airdrop.csv
+
+# 不指定 --token 则发原生币 ETH
+python batch_tx.py transfer --chain arb --key $PK \
+    --recipients "0xA:0.1ether,0xB:0.2ether"
+```
+
+### Drain：把多个代币全部转走（合并资产 / rug 自救）
+
+```bash
+python batch_tx.py drain --chain arb --key $PK \
+    --tokens 0xUSDC,0xUSDT,0xDAI,0xWETH \
+    --to 0xColdWallet \
+    --include-native    # 也把原生币（留 0.001 gas）一起 drain
+```
+
+### 任意批量 (YAML 配置文件)
+
+```bash
+python batch_tx.py run --chain arb --key $PK --config ./sample_batch.yaml
+```
+
+参考 [`sample_batch.yaml`](./sample_batch.yaml) 模板。
+
+### 公共选项
+
+```
+--simulate              只模拟不发送
+--yes / -y              跳过交互确认
+--delay 2.0             每笔之间间隔秒数（默认 1s）
+--continue-on-error     某笔失败时继续下一笔
+--gas-limit             固定 gas limit
+```
+
+---
+
+## 🏦 flashloan.py — 闪电贷（新）
+
+```bash
+# 1. 看池子地址 + 手续费
+python flashloan.py info --chain arb
+
+# 2. 生成 receiver 合约模板（你需要先部署它）
+python flashloan.py generate --provider aave --output ./MyFlashLoan.sol
+python flashloan.py generate --provider balancer --output ./MyFlashLoan.sol
+# Balancer 闪电贷手续费是 0%！
+
+# 3. 编 calldata（不发送）
+python flashloan.py encode --provider aave \
+    --receiver 0xYourDeployedReceiver \
+    --asset 0xUSDC --amount "1000 ether" \
+    --params 0xabcd...
+
+# 4. 真发起闪电贷
+python flashloan.py call --provider balancer --chain arb --key $PK \
+    --receiver 0xYourReceiver \
+    --tokens 0xUSDC,0xWETH --amounts "1000 ether,0.5 ether" \
+    --params 0xabcd... --simulate
+```
+
+### 工作流（重要）
+
+闪电贷 **必须从合约发起**，不能直接 EOA 调用：
+
+1. 用 `flashloan.py generate --provider aave -o MyFlashLoan.sol` 生成模板
+2. 在生成的合约 `_execute()` 函数里填写你的业务逻辑（套利/清算/还债）
+3. 用 Foundry/Hardhat/Remix 编译 + 部署该合约到目标链
+4. 用 `flashloan.py call --receiver 0xDeployed` 发起闪电贷
+
+**Aave V3 手续费 = 0.05%，Balancer V2 手续费 = 0%**（推荐 Balancer）。
+
+---
+
+## 🛠 cast.py — Foundry cast 兼容（新）
+
+如果你习惯 Foundry，直接用 `cast.py` 替代 Python 实现。**命令名/选项跟 Foundry cast 完全一致**。
+
+### 调用与交易
+
+```bash
+# 静态调用
+python cast.py call 0xToken "balanceOf(address)" 0xMe --rpc-url $RPC
+
+# 带 returns 类型
+python cast.py call 0xToken "name()(string)" --rpc-url $RPC
+
+# 真发交易
+python cast.py send 0xToken "transfer(address,uint256)" 0xRecv "1ether" \
+    --rpc-url $RPC --private-key $PK
+
+# 估 gas
+python cast.py estimate 0xToken "transfer(address,uint256)" 0xRecv 1000 \
+    --from 0xMe --rpc-url $RPC
+
+# 广播已签名 raw tx
+python cast.py publish 0x02f86b...
+```
+
+### 编码 / 反查
+
+```bash
+python cast.py keccak "transfer(address,uint256)"     # 算 keccak hash
+python cast.py sig "transfer(address,uint256)"        # 算 selector
+python cast.py 4byte 0xa9059cbb                       # 反查函数名
+python cast.py calldata "approve(address,uint256)" 0xR "1ether"
+python cast.py abi-encode "transfer(address,uint256)" 0xR 1000
+python cast.py abi-decode "(uint256,address)" 0x000...
+```
+
+### 数据查询
+
+```bash
+python cast.py balance 0xMe --ether --rpc-url $RPC
+python cast.py nonce 0xMe --rpc-url $RPC
+python cast.py code 0xContract --rpc-url $RPC
+python cast.py storage 0xContract 0 --rpc-url $RPC      # 读 slot 0
+python cast.py block 100 --rpc-url $RPC
+python cast.py block-number --rpc-url $RPC
+python cast.py chain-id --rpc-url $RPC
+python cast.py gas-price --gwei --rpc-url $RPC
+python cast.py tx 0xHash --rpc-url $RPC
+python cast.py receipt 0xHash --rpc-url $RPC
+```
+
+### 单位转换
+
+```bash
+python cast.py to-wei "1.5" ether          # 1500000000000000000
+python cast.py from-wei 1500000000000000000 ether    # 1.5
+python cast.py to-hex 1234                 # 0x4d2
+python cast.py to-dec 0x4d2                # 1234
+python cast.py to-checksum 0xabc...        # 转 checksum 地址
+python cast.py to-ascii 0x44494100         # DIA
+```
+
+### 钱包
+
+```bash
+python cast.py wallet-new                    # 生成随机钱包
+python cast.py wallet-address --private-key 0x...   # 私钥导地址
+```
+
+### 环境变量（同 Foundry）
+
+```bash
+export ETH_RPC_URL=https://...
+export ETH_PRIVATE_KEY=0x...
+export ETH_FROM=0xMe
+```
+
+---
+
+## 💥 selector_collide.py — 碰撞构造
+
+```bash
 python selector_collide.py check "transferOwnership(address)"
-
-# 找一个能撞上 0xa9059cbb (transfer) 的"看起来无害"的函数名
-python selector_collide.py find 0xa9059cbb \
-    --templates "init,upgrade,collect,exec" \
-    --params "|address|uint256|address,uint256" \
-    --max 5000000
-
-# 对比代理合约和实现合约的选择器（Audius 漏洞前置条件）
+python selector_collide.py find 0xa9059cbb --templates "init,upgrade,exec" --max 5000000
 python selector_collide.py compare 0xProxy 0xImpl --rpc https://...
 ```
 
-**用途**：
-- 红队：测试代理合约是否能被构造的恶意函数攻击
-- 蓝队：审计自己合约的代理 + 实现是否存在选择器冲突
-- 教学：理解"主动选择器碰撞攻击"原理
-
 ---
 
-## `selector_stats.py`
+## 📊 selector_stats.py — 频率分析
 
 ```bash
-# 批量分析多个合约的选择器频率（addresses.txt 里每行一个地址）
 python selector_stats.py topbatch addresses.txt --top 30 --chain arb
-
-# 找还有哪些合约部署了同样的字节码（用 Sourcify）
-python selector_stats.py find_addr 0x...
-
-# 同一地址在多链查询字节码差异
-python selector_stats.py crosschain 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559
+python selector_stats.py find_addr 0xContract
+python selector_stats.py crosschain 0xContract
 ```
 
 ---
 
-## `heimdall_integration.py`
-
-需要先安装 [Heimdall](https://github.com/Jon-Becker/heimdall-rs)。
+## 🔧 heimdall_integration.py — 深度反编译
 
 ```bash
-# 反编译合约成近似 Solidity
-python heimdall_integration.py decompile 0x68d319... --rpc https://...
-
-# 反汇编
-python heimdall_integration.py disasm 0x68d319...
-
-# 控制流图
-python heimdall_integration.py cfg 0x68d319... --output ./cfg/
-
-# 分析一笔具体交易
-python heimdall_integration.py inspect 0x74b749d8...
+python heimdall_integration.py decompile 0x... --rpc https://...
+python heimdall_integration.py disasm 0x... --rpc ...
+python heimdall_integration.py cfg 0x... --output ./cfg/
+python heimdall_integration.py inspect 0xTxHash
 ```
 
 ---
 
 ## 安全提示 ⚠️
 
-- **`contract_interact.py write`** 会真实发交易、真实花 gas
-- 私钥/keystore 涉及资金安全，**请只在自己的设备/服务器跑**
+- **`contract_interact.py write` / `batch_tx.py` 写命令 / `cast.py send` / `flashloan.py call`** 会真实发交易、真实花 gas
+- 私钥/keystore 涉及资金，**请只在自己的设备/服务器跑**
 - 推荐先 `--simulate` 验证，再加 `-y` 自动发送
-- 默认开启 eth_call 兜底，只有 `--force` 才能在模拟失败时强发
-- 链上数据是公开的，但**别把私钥写进代码**——用环境变量或 keystore
+- 写交易默认会 eth_call 兜底，模拟失败拒绝发送（除非 `--force`）
+- **别把私钥写进代码** —— 用环境变量或 keystore JSON
 
 ---
 
-## 完整工作流示例（以 AutoForwarder 案例为例）
+## 完整工作流示例（DIA / AutoForwarder 案例）
 
 ```bash
-# 1. 侦察合约——找出所有函数 + 危险等级 + 碰撞警告
-python contract_recon.py 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559
+# 1. 侦察
+python contract_recon.py 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559 --chain arb
 
-# 2. 深度反编译，看每个函数的具体逻辑
-python heimdall_integration.py decompile 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559
+# 2. 反编译看函数体
+python heimdall_integration.py decompile 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559 \
+    --rpc https://arb1.arbitrum.io/rpc
 
-# 3. 用 read 查关键状态
-python contract_interact.py read 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559 \
-    "admin()" --chain arb
+# 3. 用 cast 风格快速查 admin
+python cast.py call 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559 "admin()(address)" \
+    --rpc-url https://arb1.arbitrum.io/rpc
 
-# 4. 想用 admin 私钥提币时（仅在你自己合法控制的合约上）
+# 4. 批量查所有相关合约状态
+python batch_tx.py read --chain arb --calls '[
+  ["0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559","admin()"],
+  ["0x6eFa9b8883DFb78fD75CD89d8474C44c3CBDa469","totalSupply()"],
+  ["0x6eFa9b8883DFb78fD75CD89d8474C44c3CBDa469","name()"]
+]'
+
+# 5. 想用 admin 私钥提币（仅在你合法控制的合约上）
 python contract_interact.py write 0x68d319Aa647e67e00D3d97bbd2bDF3bb05575559 \
     "transfer(uint256,address)" 1000000 0xMyAddress \
     --keystore ~/keys/admin.json --simulate
-
-# 5. 检查代理 ↔ 实现的选择器冲突
-python selector_collide.py compare 0xProxy 0xImpl --rpc ...
 ```
-
----
-
-## 局限性
-
-- 只能找出 **public/external 函数**（internal/private 函数没有选择器）
-- 选择器哈希反查可能有同名碰撞——本工具自动过滤垃圾签名
-- 参数**类型**能精确推断，但参数**语义**只能靠函数体逻辑推测
-- 高度优化或 viaIR 编译的合约 dispatcher 模式可能识别不全（仍能靠 PUSH4 兜底）
-- `selector_collide.py find` 是 brute-force，4 字节空间需要 ~2³² 次哈希才能保证找到——一般几百万次能撞中
