@@ -45,7 +45,27 @@ except ImportError:
 # ============================================================================
 # 配置区
 # ============================================================================
-DEFAULT_RPC = "https://arb1.arbitrum.io/rpc"  # Arbitrum One 公共节点
+import os
+DEFAULT_RPC = os.getenv("RPC_URL", "https://arb1.arbitrum.io/rpc")
+
+# 多链一键切换（与 contract_interact.py 共享）
+CHAINS = {
+    "eth":      ("https://eth.llamarpc.com",                  "https://api.etherscan.io/api"),
+    "arb":      ("https://arb1.arbitrum.io/rpc",              "https://api.arbiscan.io/api"),
+    "arbitrum": ("https://arb1.arbitrum.io/rpc",              "https://api.arbiscan.io/api"),
+    "op":       ("https://mainnet.optimism.io",               "https://api-optimistic.etherscan.io/api"),
+    "base":     ("https://mainnet.base.org",                  "https://api.basescan.org/api"),
+    "bsc":      ("https://bsc-dataseed.binance.org",          "https://api.bscscan.com/api"),
+    "polygon":  ("https://polygon-rpc.com",                   "https://api.polygonscan.com/api"),
+    "avax":     ("https://api.avax.network/ext/bc/C/rpc",     "https://api.snowtrace.io/api"),
+    "scroll":   ("https://rpc.scroll.io",                     "https://api.scrollscan.com/api"),
+    "linea":    ("https://rpc.linea.build",                   "https://api.lineascan.build/api"),
+    "blast":    ("https://rpc.blast.io",                      "https://api.blastscan.io/api"),
+    "sepolia":  ("https://sepolia.gateway.tenderly.co",       "https://api-sepolia.etherscan.io/api"),
+    "local":    ("http://127.0.0.1:8545",                     ""),
+    "anvil":    ("http://127.0.0.1:8545",                     ""),
+    "hardhat":  ("http://127.0.0.1:8545",                     ""),
+}
 
 # EIP-1967 代理槽位（标准定义）
 EIP1967_IMPL_SLOT  = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
@@ -821,6 +841,8 @@ def main():
     parser = argparse.ArgumentParser(description="EVM 合约函数侦察工具")
     parser.add_argument("address", help="要分析的合约地址")
     parser.add_argument("--rpc", default=DEFAULT_RPC, help=f"RPC URL (默认: {DEFAULT_RPC})")
+    parser.add_argument("--chain", default=None,
+                        help=f"预设链一键切换，可选: {', '.join(CHAINS.keys())}")
     parser.add_argument("--scanner", default="https://api.arbiscan.io/api",
                         help="区块浏览器 API（用来抓历史交易样本）")
     parser.add_argument("--api-key", default="", help="区块浏览器 API key（可选）")
@@ -828,6 +850,17 @@ def main():
     parser.add_argument("--no-probe", action="store_true",
                         help="跳过静态调用探测（快但信息少）")
     args = parser.parse_args()
+
+    # 处理 --chain 参数
+    if args.chain:
+        if args.chain.lower() not in CHAINS:
+            console.print(f"[red]❌ 未知链：{args.chain}。可选: {', '.join(CHAINS.keys())}[/red]"
+                          if HAS_RICH else f"❌ 未知链：{args.chain}")
+            sys.exit(1)
+        rpc, scanner = CHAINS[args.chain.lower()]
+        args.rpc = rpc
+        if scanner:
+            args.scanner = scanner
 
     w3 = Web3(Web3.HTTPProvider(args.rpc))
     if not w3.is_connected():
