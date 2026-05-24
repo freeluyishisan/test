@@ -1153,56 +1153,520 @@ def do_replay(w3, tx_hash, account, target=None, simulate=True):
 
 
 # ==============================================================================
-# 模块 8：full —— 一条龙
+# 模块 8：reentrancy —— 重入漏洞静态检测
+# ==============================================================================
+def do_reentrancy(w3, target: str, recon_result=None) -> dict:
+    """
+    重入漏洞静态检测，分两层：
+    ─────────────────────────────────────────────────────────
+    层 1 · 字节码模式分析（pyevmasm）
+      • 扫描每个函数体内「CALL/DELEGATECALL/STATICCALL 之后是否紧跟 SSTORE」
+        ——这是经典 CEI（Checks-Effects-Interactions）违规模式
+      • 同一函数体内连续出现两次外部 CALL 也标记为可疑（跨函数重入）
+
+    层 2 · 函数签名启发式
+      • 凡含有 withdraw/claim/harvest/exit 等高危动词的函数
+        且未发现 ReentrancyGuard 模式（nonReentrant 的 SSTORE+SLOAD 哨兵）
+        均报 WARNING 级别
+
+    返回：
+      {
+        "risky_functions": [{"selector","signature","reason","level"}],
+        "has_reentrancy_guard": bool,
+        "guard_evidence": "检测到的 guard 描述",
+        "bytecode_patterns": [{"pc_call","opcode_call","pc_store","desc"}],
+        "summary": "SAFE / WARN / CRITICAL"
+      }
+    """
+    addr = to_checksum_address(target)
+    code = w3.eth.get_code(addr)
+    result = {
+        "address": addr,
+        "risky_functions": [],
+        "has_reentrancy_guard": False,
+        "guard_evidence": "",
+        "bytecode_patterns": [],
+        "summary": "SAFE",
+    }
+
+    console.print(f"\n[bold red]🔄 重入漏洞检测: {addr}[/bold red]" if HAS_RICH
+                  else f"\n重入检测: {addr}")
+
+    if not code:
+        console.print("  ❌ 无字节码")
+        return result
+
+    if not recon_result:
+        recon_result = do_recon(w3, target, verbose=False)
+
+    bc = bytes(code)
+    # 代理合约拼合实现字节码
+    if recon_result.get("proxy", {}).get("impl"):
+        try:
+            impl_code = w3.eth.get_code(to_checksum_address(recon_result["proxy"]["impl"]))
+            bc = bc + bytes(impl_code)
+        except Exception:
+            pass
+
+    # ── 层 1：pyevmasm 字节码分析 ─────────────────────────────────
+    pyevmasm = _try_import_pyevmasm()
+    if pyevmasm:
+        try:
+            insns = list(pyevmasm.disassemble_all(bc))
+            _bytecode_reentrancy_scan(insns, result)
+        except Exception as e:
+            console.print(f"  ⚠️  字节码分析失败: {e}")
+
+    # ── 层 2：函数签名启发式 ───────────────────────────────────────
+    RISKY_KEYWORDS = ["withdraw", "claim", "harvest", "exit", "redeem",
+                      "getreward", "collect", "drain", "sweep", "rescue"]
+    GUARD_KEYWORDS = ["nonreentrant", "reentrancyguard", "mutex", "locked"]
+
+    funcs = recon_result.get("functions", [])
+    has_guard_sig = any(
+        any(kw in (f.get("signature") or "").lower() for kw in GUARD_KEYWORDS)
+        for f in funcs
+    )
+
+    for f in funcs:
+        sig = (f.get("signature") or "").lower()
+        if any(kw in sig for kw in RISKY_KEYWORDS):
+            # 检查同一 selector 是否已被字节码层标记
+            already = any(p.get("selector") == f["selector"]
+                          for p in result["bytecode_patterns"])
+            level = "CRITICAL" if already else "WARNING"
+            reason = ("字节码确认：CALL 后存在 SSTORE（CEI 违规）" if already
+                      else "高危函数，需人工确认是否有 ReentrancyGuard")
+            result["risky_functions"].append({
+                "selector":  f["selector"],
+                "signature": f.get("signature"),
+                "reason":    reason,
+                "level":     level,
+            })
+
+    # ── ReentrancyGuard 探测 ──────────────────────────────────────
+    # 特征：nonReentrant 通常在入口写 SSTORE(slot, 2) 退出写 SSTORE(slot, 1)
+    # 用字节码模式识别：连续的 PUSH1 0x2 ... SSTORE / PUSH1 0x1 ... SSTORE
+    guard_detected = has_guard_sig or result.get("_guard_from_bytecode", False)
+    result["has_reentrancy_guard"] = guard_detected
+    if guard_detected:
+        result["guard_evidence"] = "检测到 ReentrancyGuard 哨兵模式（SSTORE 状态锁）"
+
+    # ── 汇总 ──────────────────────────────────────────────────────
+    criticals = [r for r in result["risky_functions"] if r["level"] == "CRITICAL"]
+    warnings  = [r for r in result["risky_functions"] if r["level"] == "WARNING"]
+
+    if criticals:
+        result["summary"] = "CRITICAL"
+    elif warnings and not guard_detected:
+        result["summary"] = "WARN"
+    else:
+        result["summary"] = "SAFE"
+
+    # 清理内部字段
+    result.pop("_guard_from_bytecode", None)
+
+    # ── 打印结果 ──────────────────────────────────────────────────
+    ICON = {"CRITICAL": "🚨", "WARN": "⚠️ ", "SAFE": "✅"}
+    SUM_COLOR = {"CRITICAL": "bold red", "WARN": "yellow", "SAFE": "green"}
+    c = SUM_COLOR.get(result["summary"], "white")
+
+    console.print(f"  守卫（ReentrancyGuard）: "
+                  f"{'✅ 已检测到' if guard_detected else '❌ 未检测到'}")
+    console.print(f"  字节码 CEI 违规: {len(result['bytecode_patterns'])} 处")
+    console.print(f"  高危函数: {len(result['risky_functions'])} 个  "
+                  f"（CRITICAL={len(criticals)}, WARNING={len(warnings)}）")
+
+    if result["risky_functions"]:
+        if HAS_RICH:
+            t = Table(box=box.SIMPLE, show_header=True)
+            t.add_column("级别", width=10)
+            t.add_column("选择器", width=12)
+            t.add_column("函数签名")
+            t.add_column("原因")
+            for r in result["risky_functions"]:
+                lc = "red" if r["level"] == "CRITICAL" else "yellow"
+                t.add_row(f"[{lc}]{r['level']}[/{lc}]",
+                          r["selector"], r["signature"] or "—", r["reason"])
+            console.print(t)
+        else:
+            for r in result["risky_functions"]:
+                print(f"  {ICON.get(r['level'],'?')} {r['level']}  "
+                      f"{r['selector']}  {r['signature']}  {r['reason']}")
+
+    if result["bytecode_patterns"]:
+        console.print("  [dim]字节码 CEI 违规详情（前 5 条）：[/dim]" if HAS_RICH
+                      else "  字节码 CEI 违规详情：")
+        for p in result["bytecode_patterns"][:5]:
+            console.print(f"    pc=0x{p['pc_call']:x} {p['opcode_call']} → "
+                          f"pc=0x{p['pc_store']:x} SSTORE  ({p['desc']})")
+
+    summary_txt = f"  综合评级: [{c}]{result['summary']}[/{c}]" if HAS_RICH \
+                  else f"  综合评级: {result['summary']}"
+    console.print(summary_txt)
+    return result
+
+
+def _bytecode_reentrancy_scan(insns, result: dict):
+    """
+    扫描指令序列，检测 CALL 系指令后是否跟随 SSTORE（CEI 违规）。
+    同时检测 ReentrancyGuard 的 SSTORE 哨兵对（写2→写1）。
+    结果写入 result["bytecode_patterns"] 和 result["_guard_from_bytecode"]。
+    """
+    CALL_OPS  = {"CALL", "DELEGATECALL", "CALLCODE", "STATICCALL"}
+    STORE_OPS = {"SSTORE"}
+    GUARD_WINDOW = 6   # PUSH1 2 ... SSTORE 通常在 6 条指令内
+
+    n = len(insns)
+    # 检测 ReentrancyGuard：PUSH1 0x2 后紧跟 SSTORE，PUSH1 0x1 后紧跟 SSTORE
+    guard_pairs = 0
+    for i in range(n - 2):
+        if (insns[i].name.startswith("PUSH") and insns[i].operand in (1, 2)
+                and insns[i+1].name == "SSTORE"):
+            guard_pairs += 1
+    if guard_pairs >= 2:
+        result["_guard_from_bytecode"] = True
+
+    # 检测 CALL → SSTORE（在 40 条指令窗口内）
+    WINDOW = 40
+    for i, ins in enumerate(insns):
+        if ins.name not in CALL_OPS:
+            continue
+        # 向后扫描窗口
+        for j in range(i + 1, min(i + 1 + WINDOW, n)):
+            nxt = insns[j]
+            if nxt.name in CALL_OPS:
+                # 又遇到一个 CALL，记录「跨函数重入」风险并停止本窗口
+                result["bytecode_patterns"].append({
+                    "pc_call":    ins.pc,
+                    "opcode_call": ins.name,
+                    "pc_store":   nxt.pc,
+                    "desc":       f"连续外部 CALL（{ins.name}→{nxt.name}），可能跨函数重入",
+                    "selector":   "",
+                })
+                break
+            if nxt.name in STORE_OPS:
+                result["bytecode_patterns"].append({
+                    "pc_call":    ins.pc,
+                    "opcode_call": ins.name,
+                    "pc_store":   nxt.pc,
+                    "desc":       f"外部 {ins.name} 后紧跟 SSTORE（CEI 违规）",
+                    "selector":   "",
+                })
+                break
+            # 遇到 JUMPDEST 表示进入新函数体，停止搜索
+            if nxt.name == "JUMPDEST":
+                break
+
+
+# ==============================================================================
+# 模块 9：flashloan_check —— 闪电贷价格操纵风险检测
+# ==============================================================================
+def do_flashloan_check(w3, target: str, recon_result=None) -> dict:
+    """
+    闪电贷价格操纵风险检测。
+    ─────────────────────────────────────────────────────────
+    检测逻辑（纯静态，无需发交易）：
+
+    维度 1 · 价格来源单一性（SPOT price oracle）
+      • 检测是否有 getPrice / price / slot0 / getReserves 类函数
+        这类函数在同一交易内可被闪电贷操控
+      • 对比是否有 TWAPOracle / getTimeWeightedAverage / latestRoundData 等
+        抗操控价格源
+
+    维度 2 · 无时间锁的借贷/铸造函数
+      • borrow / mint / flashLoan / swap 类函数
+        若在同一合约内同时存在「获取余额/价格」+ 「借贷/铸造」
+        则高度疑似可被闪电贷操纵
+
+    维度 3 · 缺少防护措施
+      • 检测是否存在 block.number / block.timestamp 检查（BLOCKHASH 指令）
+      • 检测是否有 nonReentrant / mutex 保护
+
+    返回：
+      {
+        "price_funcs":      [签名],   # 疑似 spot price 函数
+        "safe_price_funcs": [签名],   # TWAP/Chainlink 等抗操控价格源
+        "borrow_funcs":     [签名],   # 借贷/铸造触发函数
+        "has_timelock":     bool,
+        "has_guard":        bool,
+        "risk_combos":      [{"price_func","borrow_func","reason"}],
+        "summary":          "SAFE / WARN / HIGH"
+      }
+    """
+    addr = to_checksum_address(target)
+    code  = w3.eth.get_code(addr)
+    result = {
+        "address":        addr,
+        "price_funcs":    [],
+        "safe_price_funcs": [],
+        "borrow_funcs":   [],
+        "has_timelock":   False,
+        "has_guard":      False,
+        "risk_combos":    [],
+        "summary":        "SAFE",
+    }
+
+    console.print(f"\n[bold red]⚡ 闪电贷价格操纵风险检测: {addr}[/bold red]" if HAS_RICH
+                  else f"\n闪电贷风险检测: {addr}")
+
+    if not code:
+        console.print("  ❌ 无字节码")
+        return result
+
+    if not recon_result:
+        recon_result = do_recon(w3, target, verbose=False)
+
+    funcs = recon_result.get("functions", [])
+    sigs  = [(f.get("signature") or "").lower() for f in funcs]
+    orig_funcs = funcs  # 保留原始列表用于 selector 匹配
+
+    # ── 维度 1：价格来源分类 ──────────────────────────────────────
+    # 不安全的 spot price 关键词
+    SPOT_KW = ["getprice", "price(", "getrate", "slot0", "getreserves",
+               "latestsnapshot", "consult", "getamountout", "quote",
+               "getcurrentprice", "spotprice"]
+    # 抗操控价格关键词（TWAP / Chainlink）
+    SAFE_KW = ["latestrounddata", "getrounddata", "twap", "timeweighted",
+               "oracle", "pricefeed", "gettwa", "gettwap"]
+    BORROW_KW = ["borrow", "flashloan", "flash_loan", "flashborrow",
+                 "swap", "mint(", "deposit(", "leverage", "liquidat"]
+    GUARD_KW  = ["nonreentrant", "reentrancyguard", "mutex", "locked"]
+    TIMELOCK_KW = ["timelock", "delay", "lockeduntil", "timelocked"]
+
+    for f, sig_lower in zip(orig_funcs, sigs):
+        sig_orig = f.get("signature") or ""
+        if any(kw in sig_lower for kw in SPOT_KW):
+            result["price_funcs"].append(sig_orig)
+        if any(kw in sig_lower for kw in SAFE_KW):
+            result["safe_price_funcs"].append(sig_orig)
+        if any(kw in sig_lower for kw in BORROW_KW):
+            result["borrow_funcs"].append(sig_orig)
+        if any(kw in sig_lower for kw in GUARD_KW):
+            result["has_guard"] = True
+        if any(kw in sig_lower for kw in TIMELOCK_KW):
+            result["has_timelock"] = True
+
+    # ── 维度 2：字节码时间锁检测（BLOCKHASH / NUMBER 指令） ───────
+    bc = bytes(code)
+    pyevmasm = _try_import_pyevmasm()
+    if pyevmasm:
+        try:
+            insns = list(pyevmasm.disassemble_all(bc))
+            blockhash_ops = {"BLOCKHASH", "NUMBER", "TIMESTAMP"}
+            found_block_check = any(ins.name in blockhash_ops for ins in insns)
+            if found_block_check and not result["has_timelock"]:
+                result["has_timelock"] = True  # 有 block.number 比较
+        except Exception:
+            pass
+
+    # ── 维度 3：组合风险评估 ──────────────────────────────────────
+    for pf in result["price_funcs"]:
+        for bf in result["borrow_funcs"]:
+            is_safe_price = any(pf in sp for sp in result["safe_price_funcs"])
+            if is_safe_price:
+                continue
+            reason_parts = [f"spot price 函数 `{pf}` 可在 `{bf}` 同一交易内被操控"]
+            if not result["has_timelock"]:
+                reason_parts.append("无时间锁")
+            if not result["has_guard"]:
+                reason_parts.append("无重入保护")
+            result["risk_combos"].append({
+                "price_func":  pf,
+                "borrow_func": bf,
+                "reason":      "；".join(reason_parts),
+            })
+
+    # 即使无显式借贷函数，若存在 spot price + swap + 无防护，也标记 WARN
+    if not result["risk_combos"] and result["price_funcs"] and not result["safe_price_funcs"]:
+        swap_like = [s for s in sigs if "swap" in s or "exchange" in s]
+        if swap_like:
+            result["risk_combos"].append({
+                "price_func":  result["price_funcs"][0],
+                "borrow_func": swap_like[0],
+                "reason":      "合约同时含 spot price 读取与 swap 操作，可被闪电贷操控价格",
+            })
+
+    # ── 汇总 ─────────────────────────────────────────────────────
+    if result["risk_combos"] and not result["has_timelock"]:
+        result["summary"] = "HIGH"
+    elif result["price_funcs"] and not result["safe_price_funcs"]:
+        result["summary"] = "WARN"
+    else:
+        result["summary"] = "SAFE"
+
+    # ── 打印结果 ──────────────────────────────────────────────────
+    SUM_COLOR = {"HIGH": "bold red", "WARN": "yellow", "SAFE": "green"}
+    c = SUM_COLOR.get(result["summary"], "white")
+
+    console.print(f"  Spot price 函数: {len(result['price_funcs'])} 个  "
+                  f"抗操控价格源: {len(result['safe_price_funcs'])} 个")
+    console.print(f"  借贷/触发函数:   {len(result['borrow_funcs'])} 个")
+    console.print(f"  时间锁/区块检查: {'✅ 有' if result['has_timelock'] else '❌ 无'}")
+    console.print(f"  重入保护:        {'✅ 有' if result['has_guard'] else '❌ 无'}")
+
+    if result["risk_combos"]:
+        console.print(f"\n  [bold]风险组合（共 {len(result['risk_combos'])} 个）：[/bold]"
+                      if HAS_RICH else f"  风险组合：")
+        for combo in result["risk_combos"][:5]:
+            console.print(f"    💥 {combo['reason']}")
+
+    if result["price_funcs"]:
+        console.print(f"  spot price 函数: {result['price_funcs'][:4]}")
+    if result["safe_price_funcs"]:
+        console.print(f"  抗操控价格源:   {result['safe_price_funcs'][:4]}")
+    if result["borrow_funcs"]:
+        console.print(f"  借贷函数:       {result['borrow_funcs'][:4]}")
+
+    summary_txt = (f"  综合评级: [{c}]{result['summary']}[/{c}]" if HAS_RICH
+                   else f"  综合评级: {result['summary']}")
+    console.print(summary_txt)
+    return result
+
+
+# ==============================================================================
+# 模块 10：full —— 一条龙
 # ==============================================================================
 def do_full(w3, target, account, to_addr=None, token=None, simulate=True):
+    """
+    攻击一条龙（8 步）：
+      Step 0  · 反编译字节码（evmasm 快速模式，提取函数+参数类型）
+      Step 1  · 侦察（recon：函数、余额、代理、owner/admin）
+      Step 2  · 探针（probe：批量 eth_call 试通无参函数）
+      Step 3  · Sweep 参数穷举（对 RED/ORANGE 函数自动生成参数模拟调用）
+      Step 4  · Drain 提款类函数尝试
+      Step 5  · Takeover 权限接管漏洞检测
+      Step 6  · 重入漏洞静态检测（CALL→SSTORE / 函数签名启发式）
+      Step 7  · 闪电贷价格操纵风险检测（spot price + borrow 组合）
+    """
     console.print("\n" + ("="*70))
-    console.print("🚀 [bold red]攻击一条龙开始[/bold red]" if HAS_RICH else "攻击一条龙开始")
+    console.print("🚀 [bold red]攻击一条龙开始（8 步）[/bold red]" if HAS_RICH
+                  else "攻击一条龙开始（8 步）")
     console.print("="*70)
 
-    console.print("\n[bold]📡 Step 1/5: 侦察[/bold]" if HAS_RICH else "\nStep 1/5: 侦察")
+    # ── Step 0: 反编译（evmasm 快速模式，不跑 panoramix 避免超时） ──
+    console.print("\n[bold]🔬 Step 0/7: 字节码反编译（evmasm）[/bold]" if HAS_RICH
+                  else "\nStep 0/7: 字节码反编译")
+    decompile_result = do_decompile(w3, target, backend="evmasm", timeout=30)
+
+    # ── Step 1: 侦察 ─────────────────────────────────────────────
+    console.print("\n[bold]📡 Step 1/7: 侦察[/bold]" if HAS_RICH else "\nStep 1/7: 侦察")
     recon = do_recon(w3, target, verbose=True)
 
-    console.print("\n[bold]🔍 Step 2/5: 探针[/bold]" if HAS_RICH else "\nStep 2/5: 探针")
+    # ── Step 2: 探针 ─────────────────────────────────────────────
+    console.print("\n[bold]🔍 Step 2/7: 探针[/bold]" if HAS_RICH else "\nStep 2/7: 探针")
     sender = account.address if account else None
     probe_result = do_probe(w3, target, recon_result=recon, sender=sender)
 
-    console.print("\n[bold]⚔️  Step 3/5: Sweep 参数穷举[/bold]" if HAS_RICH else "\nStep 3/5: Sweep")
+    # ── Step 3: Sweep ────────────────────────────────────────────
+    console.print("\n[bold]⚔️  Step 3/7: Sweep 参数穷举[/bold]" if HAS_RICH
+                  else "\nStep 3/7: Sweep")
     sweep_result = do_sweep(w3, target, account, recon_result=recon,
                             simulate=simulate, to_addr=to_addr)
 
-    console.print("\n[bold]💸 Step 4/5: Drain 提款[/bold]" if HAS_RICH else "\nStep 4/5: Drain")
+    # ── Step 4: Drain ────────────────────────────────────────────
+    console.print("\n[bold]💸 Step 4/7: Drain 提款[/bold]" if HAS_RICH else "\nStep 4/7: Drain")
     drain_result = do_drain(w3, target, account,
                             to_addr=to_addr or (account.address if account else "0x0"),
                             token=token, simulate=simulate, recon_result=recon)
 
-    console.print("\n[bold]👑 Step 5/5: Takeover 接管检测[/bold]" if HAS_RICH else "\nStep 5/5: Takeover")
+    # ── Step 5: Takeover ─────────────────────────────────────────
+    console.print("\n[bold]👑 Step 5/7: Takeover 接管检测[/bold]" if HAS_RICH
+                  else "\nStep 5/7: Takeover")
     takeover_result = do_takeover(w3, target, account, simulate=simulate, recon_result=recon)
 
+    # ── Step 6: 重入漏洞检测 ─────────────────────────────────────
+    console.print("\n[bold]🔄 Step 6/7: 重入漏洞静态检测[/bold]" if HAS_RICH
+                  else "\nStep 6/7: 重入漏洞检测")
+    reentrant_result = do_reentrancy(w3, target, recon_result=recon)
+
+    # ── Step 7: 闪电贷价格操纵风险 ───────────────────────────────
+    console.print("\n[bold]⚡ Step 7/7: 闪电贷价格操纵风险检测[/bold]" if HAS_RICH
+                  else "\nStep 7/7: 闪电贷风险检测")
+    flashloan_result = do_flashloan_check(w3, target, recon_result=recon)
+
+    # ── 汇总报告 ─────────────────────────────────────────────────
     console.print("\n" + ("="*70))
     console.print("[bold]📊 攻击一条龙汇总[/bold]" if HAS_RICH else "攻击汇总")
     console.print("="*70)
-    console.print(f"  目标合约:    {target}")
-    console.print(f"  ETH 余额:   {recon.get('balance_eth',0):.4f} ETH")
-    console.print(f"  函数总数:   {len(recon['functions'])}")
-    console.print(f"  RED 函数:   {sum(1 for f in recon['functions'] if f['danger']=='RED')}")
-    console.print(f"  ORANGE 函数: {sum(1 for f in recon['functions'] if f['danger']=='ORANGE')}")
-    console.print(f"  可调通:     {sum(1 for p in probe_result if p.get('status')=='ok')}")
-    console.print(f"  Sweep 命中: {len(sweep_result)}")
-    console.print(f"  Drain 命中: {len(drain_result)}")
-    console.print(f"  接管漏洞:   {len(takeover_result)}")
 
-    total_vuln = len(sweep_result) + len(drain_result) + len(takeover_result)
+    decompile_sels = len(decompile_result.get("evmasm", {}).get("selectors", []))
+    reentrancy_critical = sum(1 for r in reentrant_result.get("risky_functions", [])
+                              if r["level"] == "CRITICAL")
+    reentrancy_warn     = sum(1 for r in reentrant_result.get("risky_functions", [])
+                              if r["level"] == "WARNING")
+    fl_summary = flashloan_result.get("summary", "SAFE")
+    fl_combos  = len(flashloan_result.get("risk_combos", []))
+
+    # 颜色辅助
+    def _c(val, ok_val="SAFE"):
+        """为汇总值选 rich 颜色"""
+        if not HAS_RICH:
+            return str(val)
+        if val == ok_val or val == 0 or val is False:
+            return f"[green]{val}[/green]"
+        if isinstance(val, str) and val in ("WARN", "WARNING"):
+            return f"[yellow]{val}[/yellow]"
+        return f"[bold red]{val}[/bold red]"
+
+    rows = [
+        ("目标合约",            target),
+        ("ETH 余额",            f"{recon.get('balance_eth',0):.4f} ETH"),
+        ("字节码函数数（evmasm）", str(decompile_sels)),
+        ("侦察函数总数",         str(len(recon["functions"]))),
+        ("RED/ORANGE 函数",      f"{sum(1 for f in recon['functions'] if f['danger']=='RED')} / "
+                                 f"{sum(1 for f in recon['functions'] if f['danger']=='ORANGE')}"),
+        ("探针可调通",           str(sum(1 for p in probe_result if p.get("status")=="ok"))),
+        ("Sweep 命中",           _c(len(sweep_result), 0)),
+        ("Drain 命中",           _c(len(drain_result), 0)),
+        ("接管漏洞",             _c(len(takeover_result), 0)),
+        ("重入 CRITICAL",        _c(reentrancy_critical, 0)),
+        ("重入 WARNING",         _c(reentrancy_warn, 0)),
+        ("重入守卫（Guard）",    "✅ 有" if reentrant_result.get("has_reentrancy_guard") else "❌ 无"),
+        ("闪电贷风险等级",       _c(fl_summary, "SAFE")),
+        ("闪电贷风险组合数",     _c(fl_combos, 0)),
+    ]
+
+    if HAS_RICH:
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column("项目", style="dim", width=22)
+        t.add_column("结果")
+        for k, v in rows:
+            t.add_row(k, v)
+        console.print(t)
+    else:
+        for k, v in rows:
+            print(f"  {k:<22} {v}")
+
+    # 总漏洞计数
+    total_vuln = (len(sweep_result) + len(drain_result) + len(takeover_result)
+                  + reentrancy_critical + (1 if fl_summary == "HIGH" else 0))
+
     if total_vuln > 0:
-        console.print(f"\n  🚨 [bold red]共发现 {total_vuln} 个可利用点！[/bold red]" if HAS_RICH
-                      else f"\n  发现 {total_vuln} 个可利用点")
+        console.print(
+            f"\n  🚨 [bold red]共发现 {total_vuln} 个高危可利用点！[/bold red]" if HAS_RICH
+            else f"\n  发现 {total_vuln} 个高危可利用点"
+        )
         if simulate:
             console.print("  🛑 当前为 --simulate 模式，去掉该参数可真实执行")
+    elif reentrancy_warn or fl_summary == "WARN":
+        console.print(
+            "\n  ⚠️  [yellow]发现潜在漏洞风险，建议人工审计[/yellow]" if HAS_RICH
+            else "\n  发现潜在风险，建议人工审计"
+        )
     else:
         console.print("\n  ✅ 目标合约未发现明显漏洞（不代表完全安全）")
 
-    return {"recon": recon, "probe": probe_result,
-            "sweep": sweep_result, "drain": drain_result, "takeover": takeover_result}
+    return {
+        "recon":      recon,
+        "decompile":  decompile_result,
+        "probe":      probe_result,
+        "sweep":      sweep_result,
+        "drain":      drain_result,
+        "takeover":   takeover_result,
+        "reentrancy": reentrant_result,
+        "flashloan":  flashloan_result,
+    }
 
 
 
@@ -1216,65 +1680,69 @@ def main():
         epilog="""
 ⚠️  LEGAL WARNING: 仅用于自己合约或经授权的安全测试！
 
+子命令一览：
+  recon           侦察：函数表 + admin/owner + evmasm 参数推断
+  decompile       字节码反编译（pyevmasm 反汇编 / panoramix 高层反编译）
+  probe           探针：批量 eth_call 试通无参函数
+  sweep           Sweep：对 RED/ORANGE 函数自动构造参数模拟调用
+  drain           Drain：尝试调用 withdraw/claim/harvest 类提款函数
+  takeover        Takeover：检测 initialize/transferOwnership 未保护漏洞
+  reentrancy      重入漏洞检测：字节码 CALL→SSTORE + 函数签名启发式
+  flashloan-check 闪电贷价格操纵风险：spot price + borrow 组合分析
+  selector        选择器碰撞爆破
+  replay          历史交易重放
+  full            一条龙（0~7 全步骤，含反编译+重入+闪电贷）
+
 示例：
-  # 侦察目标合约（自动包含 pyevmasm 参数推断）
-  attack.py recon 0xTarget --rpc https://...
+  # 侦察
+  attack.py recon 0xTarget --chain arb
 
-  # 反编译字节码（同时使用 pyevmasm + panoramix）
-  attack.py decompile 0xTarget --rpc https://... --backend both
+  # 反编译（both = evmasm + panoramix）
+  attack.py decompile 0xTarget --chain arb --backend both
 
-  # 仅 panoramix 高层反编译
-  attack.py decompile 0xTarget --chain arb --backend panoramix
+  # 重入漏洞检测
+  attack.py reentrancy 0xTarget --chain arb
 
-  # 仅 pyevmasm 反汇编分析
-  attack.py decompile 0xTarget --chain arb --backend evmasm
+  # 闪电贷价格操纵风险检测
+  attack.py flashloan-check 0xTarget --chain arb
 
-  # 探针扫描
-  attack.py probe 0xTarget --chain arb
-
-  # Sweep 模拟攻击
-  attack.py sweep 0xTarget --chain arb --key $PK --simulate
-
-  # Drain 提款模拟
-  attack.py drain 0xTarget --chain arb --key $PK --to 0xMe --simulate
-
-  # Takeover 接管漏洞检测
-  attack.py takeover 0xTarget --chain arb --key $PK --simulate
-
-  # 选择器碰撞爆破
-  attack.py selector 0xa9059cbb --target-name "initialize(address)"
-
-  # 历史交易重放
-  attack.py replay 0xTxHash --chain arb --key $PK --simulate
-
-  # 一条龙（默认 simulate）
+  # 一条龙（Step 0~7，默认 simulate）
   attack.py full 0xTarget --chain arb --key $PK --to 0xMe --simulate
 
+  # 其他常用
+  attack.py sweep    0xTarget --chain arb --key $PK --simulate
+  attack.py drain    0xTarget --chain arb --key $PK --to 0xMe --simulate
+  attack.py takeover 0xTarget --chain arb --key $PK --simulate
+  attack.py selector 0xa9059cbb --target-name "initialize(address)"
+  attack.py replay   0xTxHash --chain arb --key $PK --simulate
+
 环境变量：
-  PRIVATE_KEY     私钥
-  RPC_URL         默认 RPC
+  PRIVATE_KEY     私钥（--key 的替代）
+  RPC_URL         默认 RPC 地址
 """,
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     def add_common(p, need_key=False):
-        p.add_argument("--rpc", help="自定义 RPC URL")
-        p.add_argument("--chain", help=f"预设链: {', '.join(CHAINS.keys())}")
-        p.add_argument("--timeout", type=int, default=30)
+        """向子命令 parser 添加公共参数"""
+        p.add_argument("--rpc",   help="自定义 RPC URL")
+        p.add_argument("--chain", help=f"预设链名: {', '.join(CHAINS.keys())}")
+        p.add_argument("--timeout", type=int, default=30, help="RPC 超时秒数（默认30）")
         if need_key:
             p.add_argument("--key", "-k", help="私钥（或设 PRIVATE_KEY 环境变量）")
             p.add_argument("--simulate", action="store_true", default=True,
                            help="只模拟不发真实交易（默认开启）")
-            p.add_argument("--no-simulate", dest="simulate", action="store_false")
+            p.add_argument("--no-simulate", dest="simulate", action="store_false",
+                           help="真实发送链上交易（危险！）")
 
-    # recon
-    p = sub.add_parser("recon", help="侦察：提取函数 + admin/owner + evmasm 参数推断")
-    p.add_argument("target")
+    # ── recon ──────────────────────────────────────────────────────
+    p = sub.add_parser("recon", help="侦察：函数表 + admin/owner + evmasm 参数推断")
+    p.add_argument("target", help="目标合约地址")
     add_common(p)
 
-    # decompile（新增）
+    # ── decompile ──────────────────────────────────────────────────
     p = sub.add_parser("decompile",
-                       help="反编译：pyevmasm 反汇编 + panoramix 高层反编译，提取函数与参数")
+                       help="反编译：pyevmasm 反汇编 + panoramix 高层反编译")
     p.add_argument("target", help="目标合约地址")
     p.add_argument("--backend", choices=["evmasm", "panoramix", "both"], default="both",
                    help="反编译后端（默认 both）")
@@ -1283,54 +1751,71 @@ def main():
                    help="panoramix 最长等待秒数（默认 60）")
     add_common(p)
 
-    # probe
-    p = sub.add_parser("probe", help="探针：批量 eth_call 试探每个函数")
-    p.add_argument("target")
-    p.add_argument("--sender", help="模拟调用者地址")
+    # ── probe ──────────────────────────────────────────────────────
+    p = sub.add_parser("probe", help="探针：批量 eth_call 试通无参函数")
+    p.add_argument("target", help="目标合约地址")
+    p.add_argument("--sender", help="模拟调用者地址（可选）")
     add_common(p)
 
-    # sweep
-    p = sub.add_parser("sweep", help="Sweep：对高危函数发起参数穷举模拟攻击")
-    p.add_argument("target")
-    p.add_argument("--to", dest="to_addr", help="收款地址")
+    # ── sweep ──────────────────────────────────────────────────────
+    p = sub.add_parser("sweep", help="Sweep：对 RED/ORANGE 函数自动构造参数模拟攻击")
+    p.add_argument("target", help="目标合约地址")
+    p.add_argument("--to", dest="to_addr", help="攻击收款地址（默认攻击者自己）")
     add_common(p, need_key=True)
 
-    # drain
-    p = sub.add_parser("drain", help="Drain：尝试调用 withdraw/claim 类函数")
-    p.add_argument("target")
-    p.add_argument("--to", dest="to_addr", help="接收地址")
-    p.add_argument("--token", help="ERC20 token 地址")
+    # ── drain ──────────────────────────────────────────────────────
+    p = sub.add_parser("drain", help="Drain：尝试调用 withdraw/claim/harvest 类提款函数")
+    p.add_argument("target", help="目标合约地址")
+    p.add_argument("--to", dest="to_addr", help="提款接收地址")
+    p.add_argument("--token", help="顺带 drain 的 ERC20 token 地址（可选）")
     add_common(p, need_key=True)
 
-    # takeover
-    p = sub.add_parser("takeover", help="Takeover：检测权限接管漏洞")
-    p.add_argument("target")
+    # ── takeover ───────────────────────────────────────────────────
+    p = sub.add_parser("takeover", help="Takeover：检测 initialize/transferOwnership 等未保护漏洞")
+    p.add_argument("target", help="目标合约地址")
     add_common(p, need_key=True)
 
-    # selector
+    # ── reentrancy（新增）─────────────────────────────────────────
+    p = sub.add_parser("reentrancy",
+                       help="重入漏洞检测：CALL→SSTORE 字节码模式 + 函数签名启发式")
+    p.add_argument("target", help="目标合约地址")
+    add_common(p)
+
+    # ── flashloan-check（新增）────────────────────────────────────
+    p = sub.add_parser("flashloan-check",
+                       help="闪电贷价格操纵风险：spot price 函数 + borrow/swap 组合分析")
+    p.add_argument("target", help="目标合约地址")
+    add_common(p)
+
+    # ── selector ───────────────────────────────────────────────────
     p = sub.add_parser("selector", help="选择器碰撞：爆破能撞上目标 selector 的函数名")
-    p.add_argument("target_selector")
-    p.add_argument("--templates", default="init,upgrade,setOwner,collect,exec,grant")
-    p.add_argument("--max", type=int, default=3_000_000, dest="max_iter")
-    p.add_argument("--count", type=int, default=3)
-    p.add_argument("--target-name", help="目标函数真实名字（仅对比展示）")
+    p.add_argument("target_selector", help="目标 selector，如 0xa9059cbb")
+    p.add_argument("--templates", default="init,upgrade,setOwner,collect,exec,grant",
+                   help="函数名前缀模板（逗号分隔）")
+    p.add_argument("--max",   type=int, default=3_000_000, dest="max_iter",
+                   help="最大尝试次数（默认 3,000,000）")
+    p.add_argument("--count", type=int, default=3,
+                   help="最多找几个碰撞结果（默认 3）")
+    p.add_argument("--target-name", help="目标函数真实名字（仅对比展示 selector）")
 
-    # replay
+    # ── replay ─────────────────────────────────────────────────────
     p = sub.add_parser("replay", help="重放：从历史交易提取 calldata 并重放")
-    p.add_argument("tx_hash")
-    p.add_argument("--target", help="覆盖 to 地址")
+    p.add_argument("tx_hash", help="原始交易哈希")
+    p.add_argument("--target", help="覆盖 to 地址（默认用原交易 to）")
     add_common(p, need_key=True)
 
-    # full
-    p = sub.add_parser("full", help="一条龙：recon→probe→sweep→drain→takeover")
-    p.add_argument("target")
-    p.add_argument("--to", dest="to_addr", help="接收地址")
-    p.add_argument("--token", help="ERC20 token 地址")
+    # ── full（更新描述）───────────────────────────────────────────
+    p = sub.add_parser("full",
+                       help="一条龙（8步）：反编译→侦察→探针→Sweep→Drain→Takeover→重入→闪电贷")
+    p.add_argument("target", help="目标合约地址")
+    p.add_argument("--to",    dest="to_addr", help="提款/收款地址")
+    p.add_argument("--token", help="ERC20 token 地址（用于 drain）")
     add_common(p, need_key=True)
 
+    # ── 解析 & 分发 ────────────────────────────────────────────────
     args = parser.parse_args()
 
-    # selector 不需要 RPC
+    # selector 不需要 RPC，单独处理
     if args.cmd == "selector":
         do_selector(args.target_selector, target_name=args.target_name,
                     templates=args.templates, max_iter=args.max_iter, count=args.count)
@@ -1341,15 +1826,17 @@ def main():
     console.print(f"🌐 已连接 [cyan]{url}[/cyan]  Chain ID: {w3.eth.chain_id}" if HAS_RICH
                   else f"🌐 {url}  Chain {w3.eth.chain_id}")
 
+    # 加载账户
     account = load_account(args) if hasattr(args, "key") else None
     if account:
         console.print(f"🔑 攻击账户: [cyan]{account.address}[/cyan]" if HAS_RICH
                       else f"攻击账户: {account.address}")
 
+    # --no-simulate 二次确认
     simulate = getattr(args, "simulate", True)
     if not simulate:
-        console.print("[bold red]⚠️  --no-simulate 模式：将发送真实链上交易！[/bold red]" if HAS_RICH
-                      else "!! 真实交易模式")
+        console.print("[bold red]⚠️  --no-simulate 模式：将发送真实链上交易！[/bold red]"
+                      if HAS_RICH else "!! 真实交易模式")
         try:
             confirm = input("确认继续？[yes/no]: ").strip().lower()
             if confirm not in ("yes", "y"):
@@ -1357,30 +1844,44 @@ def main():
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
 
+    # ── 命令分发 ───────────────────────────────────────────────────
     if args.cmd == "recon":
         do_recon(w3, args.target)
+
     elif args.cmd == "decompile":
         do_decompile(w3, args.target,
                      backend=args.backend,
                      timeout=args.decompile_timeout)
+
     elif args.cmd == "probe":
         do_probe(w3, args.target, sender=getattr(args, "sender", None))
+
     elif args.cmd == "sweep":
         do_sweep(w3, args.target, account, simulate=simulate,
                  to_addr=getattr(args, "to_addr", None))
+
     elif args.cmd == "drain":
         do_drain(w3, args.target, account,
-                 to_addr=getattr(args,"to_addr",None) or (account.address if account else "0x0"),
-                 token=getattr(args,"token",None), simulate=simulate)
+                 to_addr=getattr(args, "to_addr", None) or (account.address if account else "0x0"),
+                 token=getattr(args, "token", None), simulate=simulate)
+
     elif args.cmd == "takeover":
         do_takeover(w3, args.target, account, simulate=simulate)
+
+    elif args.cmd == "reentrancy":
+        do_reentrancy(w3, args.target)
+
+    elif args.cmd == "flashloan-check":
+        do_flashloan_check(w3, args.target)
+
     elif args.cmd == "replay":
         do_replay(w3, args.tx_hash, account,
-                  target=getattr(args,"target",None), simulate=simulate)
+                  target=getattr(args, "target", None), simulate=simulate)
+
     elif args.cmd == "full":
         do_full(w3, args.target, account,
-                to_addr=getattr(args,"to_addr",None),
-                token=getattr(args,"token",None),
+                to_addr=getattr(args, "to_addr", None),
+                token=getattr(args, "token", None),
                 simulate=simulate)
 
 
