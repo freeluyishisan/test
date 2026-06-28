@@ -1,0 +1,17 @@
+{
+  "name": "devspace-wrapper-mcp",
+  "version": "0.1.0",
+  "description": "No-auth local MCP workspace server for GPT Secure MCP Tunnel, inspired by DevSpace/Playwright style connectors.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
