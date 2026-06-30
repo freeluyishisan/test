@@ -22,6 +22,8 @@ class Settings(BaseSettings):
 
     polymarket_enabled: bool = False
 
+    database_url: str = "sqlite:///./data/east8_weather_trader.db"
+
     hko_textonly_url: str = "https://www.hko.gov.hk/textonly/v2/forecast/text_readings_e.htm"
     hko_csv_url: str = "https://www.hko.gov.hk/wxinfo/awsgis/hko.csv"
 
