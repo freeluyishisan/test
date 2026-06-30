@@ -78,7 +78,6 @@ def parse_hko_textonly(body: str, fetched_at: datetime | None = None) -> HkoStat
     if not target_line:
         raise ValueError("HK Observatory row not found in HKO textonly body")
 
-    # Capture station, current temp, humidity, max/min.
     match = re.search(
         r"(?P<station>HK Observatory|Hong Kong Observatory)\s+"
         r"(?P<temp>N/A|-?\d+(?:\.\d+)?)\s+"
@@ -166,7 +165,6 @@ def parse_hko_csv(csv_text: str, fetched_at: datetime | None = None) -> HkoStati
     numeric_values = [_to_float(cell) for cell in target]
     numeric_values = [value for value in numeric_values if value is not None]
 
-    # Temperature range for Hong Kong practical observations.
     temp_candidates = [value for value in numeric_values if 0 <= value <= 45]
     current_temp = temp_candidates[0] if temp_candidates else None
 
@@ -183,26 +181,43 @@ def parse_hko_csv(csv_text: str, fetched_at: datetime | None = None) -> HkoStati
 def parse_textonly_king_park_radiation(
     body: str, fetched_at: datetime | None = None
 ) -> HkoStationReading | None:
-    """Parse King's Park solar radiation row from textonly page if present."""
+    """Parse King's Park solar radiation row from textonly page if present.
+
+    The page has multiple King's Park rows. Only parse after the radiation table header
+    appears, otherwise the temperature row can be misread as radiation.
+    """
     fetched_at = fetched_at or datetime.now(HK_TZ)
+    in_radiation_table = False
+
     for line in body.splitlines():
+        if "Global Solar" in line and "Direct Solar" in line and "Diffuse Solar" in line:
+            in_radiation_table = True
+            continue
+        if not in_radiation_table:
+            continue
+        if "N/A - data not available" in line:
+            break
         if "King's Park" not in line:
             continue
+
         values = re.findall(r"-?\d+(?:\.\d+)?", line)
-        # The radiation row normally has three values around W/m^2. Other King's Park rows exist.
-        if len(values) >= 3 and "Radiation" not in line:
-            nums = [_to_float(v) for v in values[-3:]]
-            if nums[0] is not None and nums[0] >= 0 and nums[1] is not None and nums[2] is not None:
-                # Heuristic: global/direct/diffuse radiation row often appears near page bottom.
-                if nums[0] > 30 or nums[1] >= 0 or nums[2] > 30:
-                    return HkoStationReading(
-                        source="hko_textonly_radiation",
-                        station="King's Park",
-                        observed_at=parse_textonly_observed_at(body, fetched_at),
-                        fetched_at=fetched_at,
-                        global_solar_wm2=nums[0],
-                        direct_solar_wm2=nums[1],
-                        diffuse_solar_wm2=nums[2],
-                        raw_line=line.rstrip(),
-                    )
+        if len(values) < 3:
+            continue
+        nums = [_to_float(v) for v in values[:3]]
+        if any(v is None for v in nums):
+            continue
+        global_solar, direct_solar, diffuse_solar = nums
+        if global_solar < 0 or direct_solar < 0 or diffuse_solar < 0:
+            continue
+
+        return HkoStationReading(
+            source="hko_textonly_radiation",
+            station="King's Park",
+            observed_at=parse_textonly_observed_at(body, fetched_at),
+            fetched_at=fetched_at,
+            global_solar_wm2=global_solar,
+            direct_solar_wm2=direct_solar,
+            diffuse_solar_wm2=diffuse_solar,
+            raw_line=line.rstrip(),
+        )
     return None
