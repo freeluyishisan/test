@@ -3,6 +3,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from backend.app.collectors.hko_snapshot import get_hko_snapshot
+from backend.app.db.sqlite_store import load_recent_snapshots, save_weather_snapshot
+from backend.app.features.temperature_trend import attach_temperature_trends
 from backend.app.models.rule_model import WeatherSnapshot, forecast
 from backend.app.strategy.edge import decide_yes_no
 
@@ -36,7 +38,14 @@ async def load_snapshot() -> tuple[WeatherSnapshot, dict[str, str]]:
         return demo_snapshot(), {"fallback_demo": f"{type(exc).__name__}: {exc}"}
 
 
-def print_snapshot(snapshot: WeatherSnapshot, source_errors: dict[str, str]) -> None:
+def enrich_and_save_snapshot(snapshot: WeatherSnapshot) -> tuple[WeatherSnapshot, int]:
+    recent_rows = load_recent_snapshots(snapshot.market_key, hours=8)
+    enriched = attach_temperature_trends(snapshot, recent_rows)
+    row_id = save_weather_snapshot(enriched)
+    return enriched, row_id
+
+
+def print_snapshot(snapshot: WeatherSnapshot, source_errors: dict[str, str], row_id: int | None) -> None:
     print("=== HKO 观测快照 ===")
     print(f"站点：{snapshot.station}")
     print(f"观测时间：{snapshot.observed_at.isoformat()}")
@@ -46,6 +55,14 @@ def print_snapshot(snapshot: WeatherSnapshot, source_errors: dict[str, str]) -> 
         print(f"湿度：{snapshot.humidity:.0f}%")
     if snapshot.radiation_global is not None:
         print(f"King's Park 全球辐射：{snapshot.radiation_global:.1f} W/m²")
+    print(
+        "升温趋势："
+        f"10分钟 {snapshot.recent_slope_10m if snapshot.recent_slope_10m is not None else 'NA'}°C，"
+        f"30分钟 {snapshot.recent_slope_30m if snapshot.recent_slope_30m is not None else 'NA'}°C，"
+        f"60分钟 {snapshot.recent_slope_60m if snapshot.recent_slope_60m is not None else 'NA'}°C"
+    )
+    if row_id is not None:
+        print(f"已保存快照：weather_snapshots.id={row_id}")
     if source_errors:
         print("源降级：")
         for name, error in source_errors.items():
@@ -79,7 +96,12 @@ def print_forecast(snapshot: WeatherSnapshot) -> None:
 
 def main() -> None:
     snapshot, source_errors = asyncio.run(load_snapshot())
-    print_snapshot(snapshot, source_errors)
+    row_id = None
+    try:
+        snapshot, row_id = enrich_and_save_snapshot(snapshot)
+    except Exception as exc:  # noqa: BLE001
+        source_errors["sqlite_store"] = f"{type(exc).__name__}: {exc}"
+    print_snapshot(snapshot, source_errors, row_id)
     print_forecast(snapshot)
 
 
