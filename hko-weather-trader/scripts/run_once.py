@@ -7,6 +7,7 @@ from backend.app.db.sqlite_store import load_recent_snapshots, save_weather_snap
 from backend.app.features.temperature_trend import attach_temperature_trends
 from backend.app.models.rule_model import WeatherSnapshot, forecast
 from backend.app.strategy.edge import decide_yes_no
+from backend.app.strategy.filters import filter_edge, filter_entry_price, filter_weather_snapshot
 
 
 def demo_snapshot() -> WeatherSnapshot:
@@ -71,9 +72,12 @@ def print_snapshot(snapshot: WeatherSnapshot, source_errors: dict[str, str], row
 
 
 def print_forecast(snapshot: WeatherSnapshot) -> None:
+    snapshot_filter = filter_weather_snapshot(snapshot)
     result = forecast(snapshot)
     print("=== 预测与盘口判断 ===")
     print(result.summary)
+    if snapshot_filter.reasons:
+        print(f"数据过滤提示：{', '.join(snapshot_filter.reasons)}")
     print()
 
     # Demo market prices. Replace with Polymarket Gamma/CLOB prices in V0.4.
@@ -85,12 +89,27 @@ def print_forecast(snapshot: WeatherSnapshot) -> None:
             model_yes_probability=prob.yes_probability,
             yes_market_price=price,
         )
+        edge_filter = filter_edge(decision.edge)
+        entry_filter = filter_entry_price(price, decision.action)
+        block_reasons = []
+        if not snapshot_filter.allowed:
+            block_reasons.extend(snapshot_filter.reasons)
+        if not edge_filter.allowed:
+            block_reasons.extend(edge_filter.reasons)
+        if not entry_filter.allowed:
+            block_reasons.extend(entry_filter.reasons)
+
+        final_action = decision.action if not block_reasons else "NO_TRADE_FILTERED"
+        final_size = decision.suggested_size_usdc if not block_reasons else 0.0
+
         print(
             f"{prob.threshold_c:.0f}°C YES | "
             f"模型 {prob.yes_probability:.1%} | 盘口 {price:.1%} | "
-            f"edge {decision.edge:+.1%} | {decision.action} | "
-            f"size={decision.suggested_size_usdc} USDC"
+            f"edge {decision.edge:+.1%} | {final_action} | "
+            f"size={final_size} USDC"
         )
+        if block_reasons:
+            print(f"  过滤：{', '.join(block_reasons)}")
         print(f"  理由：{prob.reason}")
 
 
