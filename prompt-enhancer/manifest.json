@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "AI Prompt Enhancer",
+  "version": "0.1.0",
+  "description": "Convert natural language into professional prompts with security filtering.",
+  "permissions": ["storage", "activeTab", "scripting", "clipboardWrite"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "background": {
+    "service_worker": "service-worker.js"
+  }
+}
